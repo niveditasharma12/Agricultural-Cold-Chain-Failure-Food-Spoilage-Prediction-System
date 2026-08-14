@@ -1,0 +1,6 @@
+open docker 
+docker compose up
+python script/kafka_producer.py
+docker compose up -d spark-streaming-job
+ docker exec spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-apps/spark_batch_etl.py
+docker ps -a --filter "name=airflow-webserver"

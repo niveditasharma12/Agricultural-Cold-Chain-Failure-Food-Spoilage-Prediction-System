@@ -1,0 +1,454 @@
+# =============================================================
+#  Cold Chain Food Spoilage Prediction — Docker Compose
+#  Services: Zookeeper, Kafka, Hadoop, Spark, Airflow,
+#            Postgres, MLflow, Grafana
+#  Usage   : docker compose up -d
+#  Stop    : docker compose down
+#  Reset   : docker compose down -v
+# =============================================================
+
+# ── Shared network (all services talk to each other) ─────────
+networks:
+  cold-chain-net:
+    driver: bridge
+
+# ── Named volumes (persistent data survives restarts) ────────
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+  postgres_data:
+  mlflow_data:
+  grafana_data:
+
+# =============================================================
+#  SERVICES
+# =============================================================
+services:
+
+  # ── 1. ZOOKEEPER (Kafka dependency) ──────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    hostname: zookeeper
+    networks:
+      - cold-chain-net
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # ── 2. KAFKA (message broker) ────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    hostname: kafka
+    networks:
+      - cold-chain-net
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # localhost:9092 for outside Docker, kafka:9093 for inside Docker
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 48
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  # ── 3. KAFKA TOPIC INIT (creates topics on startup) ──────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-init
+    networks:
+      - cold-chain-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Waiting for Kafka...'
+      sleep 5
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:9093 --partitions 3 --replication-factor 1 --topic sensor-raw
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:9093 --partitions 3 --replication-factor 1 --topic gps-stream
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:9093 --partitions 3 --replication-factor 1 --topic weather-feed
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:9093 --partitions 1 --replication-factor 1 --topic alerts-out
+      echo 'Topics created:'
+      kafka-topics --list --bootstrap-server kafka:9093
+      "
+    restart: on-failure
+
+  # ── 4. HADOOP NAMENODE (HDFS metadata + UI) ──────────────
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    hostname: namenode
+    networks:
+      - cold-chain-net
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    environment:
+      CLUSTER_NAME: cold-chain-cluster
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      CORE_CONF_hadoop_http_staticuser_user: root
+      HDFS_CONF_dfs_replication: 1
+      HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+    ports:
+      - "9870:9870"    # HDFS Web UI
+      - "9000:9000"    # HDFS port
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  # ── 5. HADOOP DATANODE (HDFS actual storage) ─────────────
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    hostname: datanode
+    networks:
+      - cold-chain-net
+    depends_on:
+      namenode:
+        condition: service_healthy
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      HDFS_CONF_dfs_replication: 1
+    ports:
+      - "9864:9864"    # DataNode UI
+    restart: always
+
+  # ── 6. SPARK MASTER ──────────────────────────────────────
+  #     NOTE: bitnami/spark was removed from Docker Hub's free tier
+  #     (Bitnami moved it behind their paid "Secure Images" catalog).
+  #     Using the official Apache Spark image instead.
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: spark-master
+    hostname: spark-master
+    networks:
+      - cold-chain-net
+    user: root
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "8080:8080"    # Spark Master UI
+      - "7077:7077"    # Spark Master port (workers connect here)
+    volumes:
+      - ./scripts:/opt/spark-apps        # your PySpark scripts
+      - ./data:/opt/spark-data           # your CSV data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  # ── 7. SPARK WORKER ──────────────────────────────────────
+  spark-worker:
+    image: apache/spark:3.5.3
+    container_name: spark-worker
+    hostname: spark-worker
+    networks:
+      - cold-chain-net
+    user: root
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --webui-port
+      - "8081"
+      - --cores
+      - "4"
+      - --memory
+      - "4G"
+    ports:
+      - "8081:8081"    # Spark Worker UI
+    volumes:
+      - ./scripts:/opt/spark-apps
+      - ./data:/opt/spark-data
+    restart: always
+
+  # ── 7b. SPARK STREAMING JOB (submits spark_streaming.py) ─
+  spark-streaming-job:
+    image: apache/spark:3.5.3
+    container_name: spark-streaming-job
+    hostname: spark-streaming-job
+    networks:
+      - cold-chain-net
+    user: root
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/opt/spark-apps
+      - ./data:/opt/spark-data
+    command: >
+      /opt/spark/bin/spark-submit
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,org.apache.kafka:kafka-clients:3.6.1
+      --master spark://spark-master:7077
+      --total-executor-cores 1
+      --executor-memory 1g
+      /opt/spark-apps/spark_streaming.py
+    restart: on-failure
+
+  # ── 8. POSTGRES (Airflow metadata + alerts table) ────────
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    hostname: postgres
+    networks:
+      - cold-chain-net
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # ── 9. AIRFLOW INIT (runs once — sets up DB + admin user) ─
+  airflow-init:
+    image: apache/airflow:2.7.3
+    container_name: airflow-init
+    networks:
+      - cold-chain-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: 'fbvSv3gE-3jX5qDrF5b9WwLnqD7fCCqJDJVqKVSJKZY='
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@coldchain.com \
+          --password admin
+    restart: on-failure
+
+  # ── 10. AIRFLOW WEBSERVER (UI at localhost:8085) ─────────
+  airflow-webserver:
+    image: apache/airflow:2.7.3
+    container_name: airflow-webserver
+    hostname: airflow-webserver
+    networks:
+      - cold-chain-net
+    user: root
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: 'fbvSv3gE-3jX5qDrF5b9WwLnqD7fCCqJDJVqKVSJKZY='
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'cold-chain-secret-key-2024'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - mlflow_data:/mlflow
+    ports:
+      - "8085:8080"    # Airflow Web UI (mapped to 8085 — avoids conflict with Spark)
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        apt-get update -qq && apt-get install -y -qq docker.io > /dev/null 2>&1
+        mkdir -p /mlflow && chmod -R 777 /mlflow
+        exec gosu airflow airflow webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  # ── 11. AIRFLOW SCHEDULER ────────────────────────────────
+  airflow-scheduler:
+    image: apache/airflow:2.7.3
+    container_name: airflow-scheduler
+    networks:
+      - cold-chain-net
+    user: root
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: 'fbvSv3gE-3jX5qDrF5b9WwLnqD7fCCqJDJVqKVSJKZY='
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - mlflow_data:/mlflow
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        apt-get update -qq && apt-get install -y -qq docker.io > /dev/null 2>&1
+        mkdir -p /mlflow && chmod -R 777 /mlflow
+        exec gosu airflow airflow scheduler
+    restart: always
+
+  # ── 12. MLFLOW (experiment tracking + model registry) ────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    container_name: mlflow
+    hostname: mlflow
+    networks:
+      - cold-chain-net
+    volumes:
+      - mlflow_data:/mlflow
+    ports:
+      - "5000:5000"    # MLflow UI
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --default-artifact-root /mlflow/artifacts
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000')"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  # ── 13. GRAFANA (live dashboard) ─────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    hostname: grafana
+    networks:
+      - cold-chain-net
+    depends_on:
+      - postgres
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana_datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_DOMAIN: localhost
+    ports:
+      - "3000:3000"    # Grafana UI
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  # ── 14. STREAMLIT DASHBOARD ───────────────────────────────
+  streamlit:
+    image: python:3.11-slim
+    container_name: streamlit
+    hostname: streamlit
+    networks:
+      - cold-chain-net
+    depends_on:
+      - postgres
+      - mlflow
+    volumes:
+      - ./scripts:/app
+      - ./data:/data
+    working_dir: /app
+    command: >
+      bash -c "pip install streamlit plotly pandas numpy psycopg2-binary requests --quiet &&
+               streamlit run dashboard.py
+               --server.port 8501
+               --server.address 0.0.0.0
+               --server.headless true
+               --browser.gatherUsageStats false"
+    ports:
+      - "8501:8501"
+    restart: always
+
+  # ── 15. MODEL API (FastAPI — serves Production ML models) ─
+  model-api:
+    image: python:3.11-slim
+    container_name: model-api
+    hostname: model-api
+    networks:
+      - cold-chain-net
+    depends_on:
+      - mlflow
+    volumes:
+      - ./scripts:/app
+      - mlflow_data:/mlflow
+    working_dir: /app
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    command: >
+      bash -c "pip install --quiet fastapi uvicorn mlflow==2.9.2 scikit-learn==1.3.2 tensorflow==2.13.0 pandas numpy psycopg2-binary joblib &&
+               uvicorn serve_api:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"    # Model API (Swagger docs at /docs)
+    restart: always
