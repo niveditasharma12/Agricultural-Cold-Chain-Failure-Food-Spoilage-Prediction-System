@@ -165,8 +165,3 @@ The Streamlit dashboard (`scripts/dashboard.py`) has 5 tabs:
 
 All data comes from Postgres tables that the pipeline itself writes (`fleet_status_to_postgres.py` and `alert_to_postgres.py`, both run every 15 minutes by `alert_dag`) — nothing in the dashboard is simulated or hardcoded. If a table is empty, the dashboard says so rather than fabricating data.
 
-## Known limitations
-
-- `kafka_producer.py` replays the whole CSV on every `ingest_dag` run rather than being a true continuous stream — fine for demo/dev, flagged in its own docstring as needing a real streaming source before production use.
-- The LSTM's `remaining_shelf_life_hours` target is a documented heuristic (`food_shelf_life.py`), not measured ground truth.
-- `init_db.sql` only runs automatically on a fresh Postgres volume; on an existing one, the relevant scripts (`fleet_status_to_postgres.py`, `alert_to_postgres.py`) create their own tables at runtime if missing.
